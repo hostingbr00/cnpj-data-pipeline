@@ -79,7 +79,7 @@ def main():
         logger.error("DATABASE_URL not set")
         sys.exit(1)
 
-    db = Database(config.database_url)
+    db = Database(config.database_url, load_replace=config.load_replace)
 
     try:
         # Select directory
@@ -101,6 +101,19 @@ def main():
         processed = db.get_processed_files(directory)
         pending_files = [f for f in all_files if f not in processed]
 
+        if config.neon_slim:
+            def _slim_skip(f: str) -> bool:
+                ft = get_file_type(f)
+                if ft in ("SOCIOCSV", "SIMPLESCSV"):
+                    return True
+                fu = f.upper()
+                # zips RFB: "Socios0.zip" nao casa com o padrao SOCIOCSV (nome interno difere)
+                return fu.startswith("SOCIOS") or "SIMPLES" in fu
+            skipped = [f for f in pending_files if _slim_skip(f)]
+            pending_files = [f for f in pending_files if not _slim_skip(f)]
+            if skipped:
+                logger.info(f"Slim mode: ignorando {len(skipped)} arquivo(s) de sócios/simples.")
+
         if not pending_files:
             print("All files already processed!")
             return
@@ -111,13 +124,17 @@ def main():
         pending_files.sort(key=get_file_priority)
 
         # Download and process files
+        truncated_tables = set()
         file_iterator = downloader.download_files(directory, pending_files)
         with tqdm(file_iterator, total=len(pending_files), desc="Processing", unit="file") as pbar:
             for csv_path, zip_filename in pbar:
                 pbar.set_postfix_str(csv_path.name[:30])
                 try:
                     rows = 0
-                    for batch, table_name, columns in process_file(csv_path, config.batch_size):
+                    for batch, table_name, columns in process_file(csv_path, config.batch_size, slim=config.neon_slim):
+                        if config.load_replace and table_name not in truncated_tables:
+                            db.truncate(table_name)
+                            truncated_tables.add(table_name)
                         db.bulk_upsert(batch, table_name, columns)
                         rows += len(batch)
                         pbar.set_postfix_str(f"{csv_path.name[:20]} {rows:,} rows")

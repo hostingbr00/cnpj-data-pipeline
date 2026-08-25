@@ -21,6 +21,8 @@ class Config:
     connect_timeout: int = 30
     read_timeout: int = 300
     keep_files: bool = False
+    neon_slim: bool = False  # opt-in: 1 = modo enxuto (Neon); nao quebra carga local completa
+    load_replace: bool = False  # opt-in: 1 = TRUNCATE por tabela (snapshot mensal)
     base_url: str = "https://arquivos.receitafederal.gov.br/public.php/webdav"
     share_token: str = "YggdBLfdninEJX9"
 
@@ -37,6 +39,8 @@ class Config:
             connect_timeout=int(os.getenv("CONNECT_TIMEOUT", "30")),
             read_timeout=int(os.getenv("READ_TIMEOUT", "300")),
             keep_files=os.getenv("KEEP_DOWNLOADED_FILES", "false").lower() == "true",
+            neon_slim=os.getenv("CNPJ_NEON_SLIM", "0") == "1",
+            load_replace=os.getenv("CNPJ_LOAD_REPLACE", "0") == "1",
         )
 
 

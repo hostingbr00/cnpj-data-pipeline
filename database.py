@@ -15,8 +15,9 @@ logger = logging.getLogger(__name__)
 class Database:
     """PostgreSQL database handler with temp table upsert."""
 
-    def __init__(self, database_url: str):
+    def __init__(self, database_url: str, load_replace: bool = False):
         self.database_url = database_url
+        self.load_replace = load_replace
         self._pk_cache: dict = {}
         self.conn = None
 
@@ -55,28 +56,42 @@ class Database:
 
     def get_processed_files(self, directory: str) -> Set[str]:
         """Get all processed filenames for a directory."""
-        self.connect()
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute(
-                    "SELECT filename FROM processed_files WHERE directory = %s",
-                    (directory,),
-                )
-                return {row[0] for row in cur.fetchall()}
-        except Exception:
-            return set()
+        for attempt in range(3):
+            try:
+                self.connect()
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT filename FROM processed_files WHERE directory = %s",
+                        (directory,),
+                    )
+                    return {row[0] for row in cur.fetchall()}
+            except psycopg2.OperationalError as e:
+                logger.warning(f"Queda de conexão em get_processed_files (tentativa {attempt + 1}/3): {e}")
+                self._reset_conn()
+                time.sleep(2 ** attempt)
+            except Exception:
+                return set()
+        return set()
 
     def mark_processed(self, directory: str, filename: str):
         """Mark a file as processed."""
-        self.connect()
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO processed_files (directory, filename)
-                   VALUES (%s, %s)
-                   ON CONFLICT (directory, filename) DO NOTHING""",
-                (directory, filename),
-            )
-            self.conn.commit()
+        for attempt in range(3):
+            try:
+                self.connect()
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO processed_files (directory, filename)
+                           VALUES (%s, %s)
+                           ON CONFLICT (directory, filename) DO NOTHING""",
+                        (directory, filename),
+                    )
+                    self.conn.commit()
+                return
+            except psycopg2.OperationalError as e:
+                logger.warning(f"Queda de conexão em mark_processed (tentativa {attempt + 1}/3): {e}")
+                self._reset_conn()
+                time.sleep(2 ** attempt)
+        raise RuntimeError("Falha persistente de conexão em mark_processed")
 
     def clear_processed_files(self, directory: str):
         """Clear all processed file records for a directory (for force re-processing)."""
@@ -88,35 +103,72 @@ class Database:
             )
             self.conn.commit()
 
+    def truncate(self, table_name: str):
+        """TRUNCATE de tabela de dados (modo replace — snapshot mensal é estado completo)."""
+        for attempt in range(3):
+            try:
+                self.connect()
+                with self.conn.cursor() as cur:
+                    cur.execute(f'TRUNCATE TABLE {table_name}')
+                self.conn.commit()
+                return
+            except psycopg2.OperationalError as e:
+                logger.warning(f"Queda de conexão no TRUNCATE de {table_name} (tentativa {attempt + 1}/3): {e}")
+                self._reset_conn()
+                time.sleep(2 ** attempt)
+        raise RuntimeError(f"Falha persistente de conexão no TRUNCATE de {table_name}")
+
+    def _reset_conn(self):
+        """Fecha e descarta a conexão (ex.: compute do Neon suspendeu e matou a sessão)."""
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        self.conn = None
+
     def bulk_upsert(self, df: pl.DataFrame, table_name: str, columns: List[str]):
-        """Bulk upsert using temp table + COPY."""
+        """Bulk upsert using temp table + COPY (com reconexão no caso de queda — Neon autosuspend)."""
         if df.is_empty():
             return
 
-        self.connect()
-        temp_table = f"temp_{table_name}_{id(df)}"
+        for attempt in range(3):
+            try:
+                self.connect()
+                temp_table = f"temp_{table_name}_{id(df)}"
 
-        try:
-            with self.conn.cursor() as cur:
-                # 1. Create temp table
-                cur.execute(
-                    f"CREATE TEMP TABLE {temp_table} "
-                    f"(LIKE {table_name} INCLUDING DEFAULTS INCLUDING STORAGE) ON COMMIT DROP"
-                )
+                with self.conn.cursor() as cur:
+                    # 1. Create temp table
+                    cur.execute(
+                        f"CREATE TEMP TABLE {temp_table} "
+                        f"(LIKE {table_name} INCLUDING DEFAULTS INCLUDING STORAGE) ON COMMIT DROP"
+                    )
 
-                # 2. COPY to temp
-                self._copy_to_temp(cur, df, temp_table, columns)
+                    # 2. COPY to temp
+                    self._copy_to_temp(cur, df, temp_table, columns)
 
-                # 3. Upsert from temp to main
-                primary_keys = self._get_primary_keys(cur, table_name)
-                self._upsert_from_temp(cur, temp_table, table_name, columns, primary_keys)
+                    # 3. Upsert from temp to main
+                    primary_keys = self._get_primary_keys(cur, table_name)
+                    self._upsert_from_temp(cur, temp_table, table_name, columns, primary_keys)
 
-                self.conn.commit()
+                    self.conn.commit()
+                return
 
-        except Exception as e:
-            self.conn.rollback()
-            logger.error(f"Error: {table_name}: {e}")
-            raise
+            except psycopg2.OperationalError as e:
+                logger.warning(f"Queda de conexão no upsert de {table_name} (tentativa {attempt + 1}/3): {e}")
+                self._reset_conn()
+                time.sleep(2 ** attempt)
+
+            except Exception as e:
+                if self.conn is not None:
+                    try:
+                        self.conn.rollback()
+                    except Exception:
+                        pass
+                logger.error(f"Error: {table_name}: {e}")
+                raise
+
+        raise RuntimeError(f"Falha persistente de conexão no upsert de {table_name}")
 
     def _copy_to_temp(self, cur, df: pl.DataFrame, temp_table: str, columns: List[str]):
         """COPY DataFrame to temp table using Polars CSV."""
@@ -157,7 +209,14 @@ class Database:
         update_cols = [c for c in columns if c not in primary_keys]
         update_clause = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols])
         if update_clause:
-            update_clause += ", data_atualizacao = CURRENT_TIMESTAMP"
+            # tabelas enxutas (Neon/slim) não têm data_atualizacao
+            cur.execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = %s AND column_name = 'data_atualizacao'",
+                (target_table,),
+            )
+            if cur.fetchone():
+                update_clause += ", data_atualizacao = CURRENT_TIMESTAMP"
 
         sql = f"""
             INSERT INTO {target_table} ({columns_str})

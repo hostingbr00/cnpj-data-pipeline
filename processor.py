@@ -122,7 +122,7 @@ def _convert_encoding(file_path: Path) -> Path:
 
 
 def process_file(
-    file_path: Path, batch_size: int = 50000
+    file_path: Path, batch_size: int = 50000, slim: bool = False
 ) -> Generator[Tuple[pl.DataFrame, str, List[str]], None, None]:
     """Process a CSV file and yield batches as Polars DataFrames."""
     file_type = get_file_type(file_path.name)
@@ -132,6 +132,10 @@ def process_file(
 
     table_name = FILE_MAPPINGS[file_type]
     columns = COLUMNS[file_type]
+
+    if slim and file_type in ("SOCIOCSV", "SIMPLESCSV"):
+        logger.info(f"Slim mode: pulando {file_type} (fora do escopo enxuto do Neon).")
+        return
 
     # Convert encoding first (faster for Polars to read UTF-8)
     utf8_file = _convert_encoding(file_path)
@@ -159,19 +163,46 @@ def process_file(
             if df.is_empty():
                 break
 
-            df = _transform(df, file_type)
-            yield df, table_name, columns
+            raw_len = len(df)
+            df = _transform(df, file_type, slim)
+            out_columns = columns  # colunas de saída; a leitura usa SEMPRE o schema completo
+            if slim:
+                if file_type == "EMPRECSV":
+                    df = df.select(["cnpj_basico", "capital_social"])
+                    out_columns = ["cnpj_basico", "capital_social"]
+                elif file_type == "ESTABELE":
+                    df = df.select([
+                        "cnpj_basico", "cnpj_ordem", "cnpj_dv",
+                        "situacao_cadastral", "municipio", "uf",
+                    ])
+                    out_columns = [
+                        "cnpj_basico", "cnpj_ordem", "cnpj_dv",
+                        "situacao_cadastral", "municipio", "uf",
+                    ]
 
-            # End of file if we got fewer rows than requested
-            if len(df) < batch_size:
+            if df.is_empty():
+                # chunk inteira filtrada (ex.: so não-ATIVAS): avança sem parar o arquivo
+                if raw_len < batch_size:
+                    break
+                offset += raw_len
+                continue
+
+            yield df, table_name, out_columns
+
+            # End of file if we got fewer rows than requested (tamanho BRUTO do chunk)
+            if raw_len < batch_size:
                 break
-            offset += len(df)
+            offset += raw_len
     finally:
         utf8_file.unlink(missing_ok=True)
 
 
-def _transform(df: pl.DataFrame, file_type: str) -> pl.DataFrame:
+def _transform(df: pl.DataFrame, file_type: str, slim: bool = False) -> pl.DataFrame:
     """Apply transformations based on file type."""
+
+    # Slim (Neon): somente estabelecimentos ATIVAS (02)
+    if slim and file_type == "ESTABELE" and "situacao_cadastral" in df.columns:
+        df = df.filter(pl.col("situacao_cadastral") == "02")
 
     # Capital social: "1.234,56" → "1234.56"
     if file_type == "EMPRECSV" and "capital_social" in df.columns:
