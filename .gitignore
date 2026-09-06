@@ -7,3 +7,5 @@ temp/
 .pytest_cache/
 .coverage
 coverage.xml
+### Tool cache (never commit)
+repomix-output.xml
