@@ -148,3 +148,15 @@ CREATE INDEX IF NOT EXISTS idx_estabelecimentos_municipio ON estabelecimentos(mu
 CREATE INDEX IF NOT EXISTS idx_estabelecimentos_situacao ON estabelecimentos(situacao_cadastral);
 CREATE INDEX IF NOT EXISTS idx_estabelecimentos_cnae ON estabelecimentos(cnae_fiscal_principal);
 CREATE INDEX IF NOT EXISTS idx_socios_cnpj_basico ON socios(cnpj_basico);
+
+-- Export optimization: DDD + capital_social > 100k + anti-join no ledger cnpj_exports
+CREATE INDEX IF NOT EXISTS idx_estabelecimentos_ddd1_cnpj
+    ON estabelecimentos(ddd_1, cnpj_basico, cnpj_ordem, cnpj_dv)
+    WHERE ddd_1 IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_estabelecimentos_ddd2_cnpj
+    ON estabelecimentos(ddd_2, cnpj_basico, cnpj_ordem, cnpj_dv)
+    WHERE ddd_2 IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_empresas_cnpj_capital
+    ON empresas(cnpj_basico, capital_social);
