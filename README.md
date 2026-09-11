@@ -51,7 +51,7 @@ just run --month 2024-11 --force  # Forçar reprocessamento
 ## Configuração
 
 ```bash
-DATABASE_URL=postgres://postgres:postgres@localhost:5435/cnpj
+DATABASE_URL=postgres://postgres:postgres@localhost:5436/cnpj
 BATCH_SIZE=500000
 TEMP_DIR=./temp
 DOWNLOAD_WORKERS=4

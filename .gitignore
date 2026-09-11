@@ -9,3 +9,6 @@ temp/
 coverage.xml
 ### Tool cache (never commit)
 repomix-output.xml
+
+### Overrides locais de quem roda (máquina/HD específicos)
+docker-compose.local.yml
