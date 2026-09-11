@@ -1,0 +1,29 @@
+# Postgres isolado com volume Docker (sem bind em HD externo).
+# Útil se o compose principal falhar (ex.: caminho /Volumes/... indisponível).
+#
+# Uso:
+#   docker compose -f docker-compose.postgres-standalone.yml up -d
+#
+# Atenção: porta 5436 — pare o serviço postgres do compose principal antes, se existir.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cnpj-postgres-standalone
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: cnpj
+    ports:
+      - "5436:5432"
+    volumes:
+      - cnpj_standalone_pgdata:/var/lib/postgresql/data
+    shm_size: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  cnpj_standalone_pgdata:
