@@ -123,8 +123,18 @@ def main():
         # Sort files by processing order
         pending_files.sort(key=get_file_priority)
 
+        # Marca a janela de carga antes do primeiro TRUNCATE (o export bloqueia).
+        run_id = db.start_load_run(directory)
+
         # Download and process files
-        truncated_tables = set()
+        # Retomada segura: o conjunto de tabelas já truncadas vem do banco, não do
+        # processo. Um 2º run do mesmo mês retruncaria a tabela e carregaria só os
+        # arquivos restantes (os anteriores já estão em processed_files) => tabela
+        # parcial com status "processado".
+        truncated_tables = (
+            db.truncated_in_directory(directory) if config.load_replace else set()
+        )
+        failures = []
         file_iterator = downloader.download_files(directory, pending_files)
         with tqdm(file_iterator, total=len(pending_files), desc="Processing", unit="file") as pbar:
             for csv_path, zip_filename in pbar:
@@ -134,6 +144,7 @@ def main():
                     for batch, table_name, columns in process_file(csv_path, config.batch_size, slim=config.neon_slim):
                         if config.load_replace and table_name not in truncated_tables:
                             db.truncate(table_name)
+                            db.mark_truncated(directory, table_name)
                             truncated_tables.add(table_name)
                         db.bulk_upsert(batch, table_name, columns)
                         rows += len(batch)
@@ -142,12 +153,28 @@ def main():
                     db.mark_processed(directory, zip_filename)
 
                 except Exception as e:
+                    failures.append((zip_filename, str(e)))
                     logger.error(f"Error: {csv_path.name}: {e}")
 
                 finally:
                     if csv_path.exists() and not config.keep_files:
                         csv_path.unlink()
 
+        if failures:
+            logger.error(
+                "Carga INCOMPLETA: %d arquivo(s) falharam e NÃO foram marcados como processados:",
+                len(failures),
+            )
+            for name, err in failures:
+                logger.error("  - %s: %s", name, err)
+            logger.error(
+                "Re-execute o mesmo mês para retomar (processed_files preserva o progresso; "
+                "load_truncated impede retruncar tabelas já iniciadas)."
+            )
+            db.finish_load_run(run_id, f"FALHA: {len(failures)} arquivo(s) com erro")
+            sys.exit(1)
+
+        db.finish_load_run(run_id, "OK")
         print("Done!")
 
     except Exception as e:

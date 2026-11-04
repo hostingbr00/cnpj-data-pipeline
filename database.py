@@ -11,6 +11,21 @@ import psycopg2
 
 logger = logging.getLogger(__name__)
 
+# Tabelas que o modo replace pode TRUNCATE. Lista branca dura: dados RFB apenas.
+# NUNCA incluir cnpj_exports / cnpj_export_cursor / ddd_regions — são rastro de
+# entrega e seed de região, não snapshot da Receita.
+ALLOWED_TRUNCATE = frozenset({
+    "estabelecimentos",
+    "empresas",
+    "cnaes",
+    "motivos",
+    "municipios",
+    "naturezas_juridicas",
+    "paises",
+    "qualificacoes_socios",
+    "top_companies_2m",
+})
+
 
 class Database:
     """PostgreSQL database handler with temp table upsert."""
@@ -105,6 +120,12 @@ class Database:
 
     def truncate(self, table_name: str):
         """TRUNCATE de tabela de dados (modo replace — snapshot mensal é estado completo)."""
+        if table_name not in ALLOWED_TRUNCATE:
+            raise RuntimeError(
+                f"TRUNCATE bloqueado: '{table_name}' não está na lista branca de dados RFB "
+                f"(ALLOWED_TRUNCATE). Rastro de entrega (cnpj_exports/cnpj_export_cursor) "
+                f"e ddd_regions nunca são truncados por carga."
+            )
         for attempt in range(3):
             try:
                 self.connect()
@@ -117,6 +138,108 @@ class Database:
                 self._reset_conn()
                 time.sleep(2 ** attempt)
         raise RuntimeError(f"Falha persistente de conexão no TRUNCATE de {table_name}")
+
+    def truncated_in_directory(self, directory: str) -> Set[str]:
+        """Tabelas já truncadas para este diretório (controle persistente de retomada).
+
+        Um segundo run do mesmo mês (após queda de conexão/timeout) NÃO pode
+        retruncar a tabela: os arquivos já carregados estão em processed_files e
+        seriam pulados, deixando a tabela com apenas parte dos dados e status
+        'completo'. O registro fica no banco, não no processo.
+        """
+        for attempt in range(3):
+            try:
+                self.connect()
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        """CREATE TABLE IF NOT EXISTS load_truncated (
+                               directory  VARCHAR(50)  NOT NULL,
+                               table_name VARCHAR(64)  NOT NULL,
+                               truncated_at TIMESTAMP DEFAULT NOW(),
+                               PRIMARY KEY (directory, table_name)
+                           )"""
+                    )
+                    self.conn.commit()
+                    cur.execute(
+                        "SELECT table_name FROM load_truncated WHERE directory = %s",
+                        (directory,),
+                    )
+                    return {row[0] for row in cur.fetchall()}
+            except psycopg2.OperationalError as e:
+                logger.warning(f"Queda de conexão em truncated_in_directory (tentativa {attempt + 1}/3): {e}")
+                self._reset_conn()
+                time.sleep(2 ** attempt)
+        raise RuntimeError("Falha persistente de conexão em truncated_in_directory")
+
+    def mark_truncated(self, directory: str, table_name: str):
+        """Registra o TRUNCATE de uma tabela para este diretório (idempotente)."""
+        for attempt in range(3):
+            try:
+                self.connect()
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO load_truncated (directory, table_name)
+                           VALUES (%s, %s)
+                           ON CONFLICT (directory, table_name) DO NOTHING""",
+                        (directory, table_name),
+                    )
+                    self.conn.commit()
+                return
+            except psycopg2.OperationalError as e:
+                logger.warning(f"Queda de conexão em mark_truncated (tentativa {attempt + 1}/3): {e}")
+                self._reset_conn()
+                time.sleep(2 ** attempt)
+        raise RuntimeError("Falha persistente de conexão em mark_truncated")
+
+    def start_load_run(self, directory: str) -> int:
+        """Registra o início da carga (sinal durável para o export não rodar na janela).
+
+        O export consulta load_run antes de selecionar; sem isso a única proteção
+        era pg_stat_activity, que fica vazio enquanto o pipeline baixa o próximo ZIP.
+        """
+        for attempt in range(3):
+            try:
+                self.connect()
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        """CREATE TABLE IF NOT EXISTS load_run (
+                               run_id     BIGSERIAL PRIMARY KEY,
+                               directory  VARCHAR(50) NOT NULL,
+                               started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                               finished_at TIMESTAMPTZ,
+                               note       TEXT
+                           )"""
+                    )
+                    cur.execute(
+                        "INSERT INTO load_run (directory) VALUES (%s) RETURNING run_id",
+                        (directory,),
+                    )
+                    run_id = cur.fetchone()[0]
+                    self.conn.commit()
+                    return run_id
+            except psycopg2.OperationalError as e:
+                logger.warning(f"Queda de conexão em start_load_run (tentativa {attempt + 1}/3): {e}")
+                self._reset_conn()
+                time.sleep(2 ** attempt)
+        raise RuntimeError("Falha persistente de conexão em start_load_run")
+
+    def finish_load_run(self, run_id: int, note: str = ""):
+        """Marca a carga como concluída (sucesso ou falha — o note diz qual)."""
+        for attempt in range(3):
+            try:
+                self.connect()
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE load_run SET finished_at = NOW(), note = %s WHERE run_id = %s",
+                        (note[:500], run_id),
+                    )
+                    self.conn.commit()
+                return
+            except psycopg2.OperationalError as e:
+                logger.warning(f"Queda de conexão em finish_load_run (tentativa {attempt + 1}/3): {e}")
+                self._reset_conn()
+                time.sleep(2 ** attempt)
+        raise RuntimeError("Falha persistente de conexão em finish_load_run")
 
     def _reset_conn(self):
         """Fecha e descarta a conexão (ex.: compute do Neon suspendeu e matou a sessão)."""
