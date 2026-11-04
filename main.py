@@ -135,9 +135,11 @@ def main():
             db.truncated_in_directory(directory) if config.load_replace else set()
         )
         failures = []
+        delivered = set()
         file_iterator = downloader.download_files(directory, pending_files)
         with tqdm(file_iterator, total=len(pending_files), desc="Processing", unit="file") as pbar:
             for csv_path, zip_filename in pbar:
+                delivered.add(zip_filename)
                 pbar.set_postfix_str(csv_path.name[:30])
                 try:
                     rows = 0
@@ -159,6 +161,14 @@ def main():
                 finally:
                     if csv_path.exists() and not config.keep_files:
                         csv_path.unlink()
+
+        # Downloader engole falha de download (logger.error) e simplesmente não
+        # entrega o arquivo. Sem esta checagem a carga fecharia "Done!" deixando
+        # um ZIP inteiro de fora — foi o que aconteceu com Estabelecimentos4.zip.
+        missing = [f for f in pending_files if f not in delivered]
+        for name in missing:
+            failures.append((name, "não entregue pelo downloader (falha de download/ZIP)"))
+            logger.error("Arquivo não entregue: %s", name)
 
         if failures:
             logger.error(
