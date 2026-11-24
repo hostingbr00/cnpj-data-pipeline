@@ -168,8 +168,8 @@ def process_file(
             out_columns = columns  # colunas de saída; a leitura usa SEMPRE o schema completo
             if slim:
                 if file_type == "EMPRECSV":
-                    df = df.select(["cnpj_basico", "capital_social"])
-                    out_columns = ["cnpj_basico", "capital_social"]
+                    out_columns = ["cnpj_basico", "natureza_juridica", "capital_social"]
+                    df = df.select(out_columns)
                 elif file_type == "ESTABELE":
                     df = df.select([
                         "cnpj_basico", "cnpj_ordem", "cnpj_dv",

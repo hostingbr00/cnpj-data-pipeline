@@ -297,3 +297,43 @@ class TestProcessFile:
         assert len(results[0][0]) == 50
         assert len(results[1][0]) == 50
         assert len(results[2][0]) == 50
+
+    def test_slim_empresas_preserves_natureza_and_capital_across_batches(self, tmp_path):
+        empresas_file = tmp_path / "F.K03200$W.EMPRECSV.D61001"
+        empresas_file.write_text(
+            '00000001;Empresa LTDA;2062;49;100000,00;01;\n'
+            '00000002;Sociedade simples;2240;49;100000,01;03;\n'
+            '00000003;Outra natureza;0010;05;99999,99;05;',
+            encoding="ISO-8859-1",
+        )
+
+        results = list(process_file(empresas_file, batch_size=2, slim=True))
+
+        assert len(results) == 2
+        for df, table_name, columns in results:
+            assert table_name == "empresas"
+            assert columns == ["cnpj_basico", "natureza_juridica", "capital_social"]
+            assert df.columns == columns
+        combined = pl.concat([result[0] for result in results])
+        assert combined["cnpj_basico"].to_list() == ["00000001", "00000002", "00000003"]
+        assert combined["natureza_juridica"].to_list() == ["2062", "2240", "0010"]
+        assert combined["capital_social"].to_list() == ["100000.00", "100000.01", "99999.99"]
+
+    def test_full_empresas_preserves_complete_schema(self, tmp_path):
+        empresas_file = tmp_path / "EMPRECSV.csv"
+        empresas_file.write_text(
+            "00000001;Empresa LTDA;2062;49;100000,00;01;",
+            encoding="ISO-8859-1",
+        )
+
+        [(df, table_name, columns)] = list(process_file(empresas_file, slim=False))
+
+        assert table_name == "empresas"
+        assert columns == [
+            "cnpj_basico", "razao_social", "natureza_juridica",
+            "qualificacao_responsavel", "capital_social", "porte", "ente_federativo_responsavel",
+        ]
+        assert df.columns == columns
+        assert df["razao_social"].to_list() == ["Empresa LTDA"]
+        assert df["natureza_juridica"].to_list() == ["2062"]
+        assert df["capital_social"].to_list() == ["100000.00"]
